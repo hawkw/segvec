@@ -23,7 +23,9 @@
 //!   in a `SegVec`. If you need to slice your vector, you can't use this.
 use std::{
     fmt,
+    iter::FromIterator,
     ops::{Index, IndexMut},
+    slice,
 };
 
 #[cfg(test)]
@@ -68,7 +70,6 @@ macro_rules! test_dbg {
     };
 }
 
-#[derive(Debug)]
 pub struct SegVec<T> {
     /// The total number of elements in this `SegVec`.
     ///
@@ -93,6 +94,24 @@ pub struct SegVec<T> {
     /// The "index block". This holds pointers to the allocated data blocks.
     index: Vec<Block<T>>,
 }
+
+#[derive(Debug)]
+pub struct Iter<'segvec, T> {
+    len: usize,
+    blocks: slice::Iter<'segvec, Block<T>>,
+    curr_block: slice::Iter<'segvec, T>,
+}
+
+#[derive(Debug)]
+pub struct IterMut<'segvec, T> {
+    len: usize,
+    blocks: slice::IterMut<'segvec, Block<T>>,
+    curr_block: slice::IterMut<'segvec, T>,
+}
+
+/// TODO(eliza): consider making this an API?
+#[cfg(test)]
+struct DebugDetails<'segvec, T>(&'segvec SegVec<T>);
 
 struct Block<T> {
     elements: Vec<T>,
@@ -195,6 +214,33 @@ impl<T> SegVec<T> {
         len
     }
 
+    pub fn iter(&self) -> Iter<'_, T> {
+        let mut blocks = self.index.iter();
+        let curr_block = blocks
+            .next()
+            .map(|block| block.elements.iter())
+            .unwrap_or_else(|| [].iter());
+        Iter {
+            len: self.len(),
+            blocks,
+            curr_block,
+        }
+    }
+
+    pub fn iter_mut(&mut self) -> IterMut<'_, T> {
+        let len = self.len();
+        let mut blocks = self.index.iter_mut();
+        let curr_block = blocks
+            .next()
+            .map(|block| block.elements.iter_mut())
+            .unwrap_or_else(|| [].iter_mut());
+        IterMut {
+            len,
+            blocks,
+            curr_block,
+        }
+    }
+
     /// Grow:
     /// 1. If the last non-empty data block `DB[d-1]` is full:
     fn grow(&mut self) {
@@ -215,6 +261,11 @@ impl<T> SegVec<T> {
         // (b). if there are no empty data blocks:
         self.index.push(Block::new(self.block_cap));
         self.sb_len += 1;
+    }
+
+    #[cfg(test)] // TODO(eliza): consider making this an API?
+    fn debug_details(&self) -> DebugDetails<'_, T> {
+        DebugDetails(self)
     }
 }
 
@@ -248,6 +299,115 @@ impl<T> IndexMut<usize> for SegVec<T> {
     }
 }
 
+impl<T> Extend<T> for SegVec<T> {
+    fn extend<I>(&mut self, iter: I)
+    where
+        I: IntoIterator<Item = T>,
+    {
+        for item in iter.into_iter() {
+            self.push(item);
+        }
+    }
+
+    // TODO(eliza): add `extend_reserve` once that works!
+}
+
+impl<T: fmt::Debug> fmt::Debug for SegVec<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+impl<T> FromIterator<T> for SegVec<T> {
+    fn from_iter<I>(iter: I) -> Self
+    where
+        I: IntoIterator<Item = T>,
+    {
+        let iter = iter.into_iter();
+
+        // TODO(eliza): we can't do this until `with_capacity` doesn't break
+        // indexing...
+
+        // // Try to preallocate a block that will fit the entire iterator.
+        // let (lower, upper) = iter.size_hint();
+        // // If the size hint has an upper bound, use that as the capacity so we
+        // // can put all the elements in one block. Otherwise, make the first
+        // // block the size hint's lower bound.
+        // let cap = upper.unwrap_or(lower);
+        // let mut this = Self::with_capacity(cap);
+
+        // TODO(eliza): we could just use `Vec::collect` and push that as block 1...
+        let mut this = Self::new();
+        this.extend(iter);
+        this
+    }
+}
+
+impl<'segvec, T> IntoIterator for &'segvec SegVec<T> {
+    type IntoIter = Iter<'segvec, T>;
+    type Item = &'segvec T;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<'segvec, T> IntoIterator for &'segvec mut SegVec<T> {
+    type IntoIter = IterMut<'segvec, T>;
+    type Item = &'segvec mut T;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
+    }
+}
+// === impl Iter ===
+
+impl<'segvec, T> Iterator for Iter<'segvec, T> {
+    type Item = &'segvec T;
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(elem) = self.curr_block.next() {
+                return Some(elem);
+            }
+            self.curr_block = self.blocks.next()?.elements.iter();
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.len, Some(self.len))
+    }
+}
+
+impl<T> ExactSizeIterator for Iter<'_, T> {
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
+// === impl IterMut ===
+
+impl<'segvec, T> Iterator for IterMut<'segvec, T> {
+    type Item = &'segvec mut T;
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(elem) = self.curr_block.next() {
+                return Some(elem);
+            }
+            self.curr_block = self.blocks.next()?.elements.iter_mut();
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.len, Some(self.len))
+    }
+}
+
+impl<T> ExactSizeIterator for IterMut<'_, T> {
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
 // === impl Block ==
 
 impl<T> Block<T> {
@@ -278,6 +438,22 @@ impl<T: fmt::Debug> fmt::Debug for Block<T> {
     }
 }
 
+// === impl DebugDetails ===
+
+#[cfg(test)] // TODO(eliza): consider making this an API?
+impl<T: fmt::Debug> fmt::Debug for DebugDetails<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SegVec")
+            .field("len", &self.0.len())
+            .field("superblock", &self.0.superblock)
+            .field("sb_cap", &self.0.sb_cap)
+            .field("sb_len", &self.0.sb_len)
+            .field("block_cap", &self.0.block_cap)
+            .field("index", &self.0.index)
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,13 +476,20 @@ mod tests {
             let mut segvec = SegVec::with_capacity(1);
             for (i, elem) in vec.iter().enumerate() {
                 let pushed_idx = segvec.push(elem);
-                prop_assert_eq!(pushed_idx, i, "   vec={:?}\nsegvec={:#?}", vec, segvec);
+                prop_assert_eq!(pushed_idx, i, "   vec={:?}\nsegvec={:#?}", vec, segvec.debug_details());
             }
 
             for (i, elem) in vec.iter().enumerate() {
                 println!("vec[{}] = {}", i, elem);
-                prop_assert_eq!(segvec[i], elem, "i={}\n   vec={:?}\nsegvec={:#?}", i, vec, segvec)
+                prop_assert_eq!(segvec[i], elem, "i={}\n   vec={:?}\nsegvec={:#?}", i, vec, segvec.debug_details())
             }
+        }
+
+        #[test]
+        fn iter_roundtrip(vec: Vec<usize>) {
+            let segvec: SegVec<usize> = vec.iter().cloned().collect();
+            let vec2: Vec<usize> = segvec.iter().cloned().collect();
+            prop_assert_eq!(&vec, &vec2, "vec={:?}, vec2={:?}, segvec={:#?}", vec, vec2, segvec.debug_details());
         }
     }
 }
