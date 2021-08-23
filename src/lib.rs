@@ -22,7 +22,7 @@
 //!   _iterate_ over ranges of a `SegVec`, but you cannot obtain a slice of data
 //!   in a `SegVec`. If you need to slice your vector, you can't use this.
 use std::{
-    fmt,
+    cmp, fmt,
     iter::FromIterator,
     mem,
     ops::{Index, IndexMut},
@@ -84,6 +84,9 @@ pub struct SegVec<T> {
 
     /// The "index block". This holds pointers to the allocated data blocks.
     index: Vec<Block<T>>,
+
+    #[cfg(debug_assertions)]
+    is_initialized: bool,
 }
 
 #[derive(Debug)]
@@ -135,8 +138,14 @@ struct Block<T> {
 struct DebugDetails<'segvec, T>(&'segvec SegVec<T>);
 
 impl<T> SegVec<T> {
-    pub fn new() -> Self {
-        Self::with_capacity(0)
+    pub const fn new() -> Self {
+        Self {
+            meta: Meta::empty(),
+            index: Vec::new(),
+            capacity: 0,
+            #[cfg(debug_assertions)]
+            is_initialized: false,
+        }
     }
 
     // Minimum size of the first data block `Vec`.
@@ -151,43 +160,10 @@ impl<T> SegVec<T> {
         1
     };
 
-    pub fn with_capacity(mut capacity: usize) -> Self {
-        // If the requested capacity is not a power of two, round up to the next
-        // power of two.
-        if test_dbg!(capacity > 0 && !capacity.is_power_of_two()) {
-            capacity = test_dbg!(capacity.next_power_of_two());
-        };
-
-        // If the capacity is less than the reasonable minimum capacity for the
-        // size of elements in the `SegVec`, use that capacity instead.
-        test_dbg!(let capacity = std::cmp::max(capacity, Self::MIN_NON_ZERO_CAP););
-
-        let mut meta = Meta::empty();
-
-        // Grow the metadata up to the requested capacity.
-        while test_dbg!(meta.block_cap) < capacity {
-            meta.grow();
-            meta.skipped_blocks += 1;
-            meta.skipped_indices += meta.block_cap;
-            let _ = test_dbg!(&meta);
-        }
-
-        // Build the index, in a vector with enough room for at least the number
-        // of skipped data blocks plus the first actual data block.
-        let mut index = Vec::with_capacity(meta.skipped_blocks);
-
-        // Grow the metadata again and push the first actual data block.
-        meta.grow();
-        index.push(Block::new(capacity));
-        debug_assert_eq!(meta.block_cap, capacity);
-
-        let _ = test_dbg!(&meta);
-
-        Self {
-            meta,
-            index,
-            capacity,
-        }
+    pub fn with_capacity(capacity: usize) -> Self {
+        let mut this = Self::new();
+        this.reserve(capacity);
+        this
     }
 
     /// Returns the number of elements the `SegVec` can hold without
@@ -243,15 +219,38 @@ impl<T> SegVec<T> {
     /// sv.reserve(10);
     /// assert!(sv.capacity() >= 11);
     /// ```
-    pub fn reserve(&mut self, additional: usize) {
+    pub fn reserve(&mut self, mut additional: usize) {
         assert!(additional < isize::MAX as usize);
 
-        if self.capacity() - self.len() >= additional {
+        if additional == 0 {
             return;
         }
 
-        while self.capacity() - self.len() < additional {
+        if self.capacity == 0 {
+            // If the requested capacity is not a power of two, round up to the next
+            // power of two.
+            if test_dbg!(!additional.is_power_of_two()) {
+                additional = test_dbg!(additional.next_power_of_two());
+            };
+
+            // If the capacity is less than the reasonable minimum capacity for the
+            // size of elements in the `SegVec`, use that capacity instead.
+            test_dbg!(let additional = cmp::max(additional, Self::MIN_NON_ZERO_CAP););
+            self.initialize(additional);
+            return;
+        }
+
+        debug_assert!(self.is_initialized);
+
+        let _ = test_dbg!((self.capacity(), self.len(), additional));
+
+        if test_dbg!(self.capacity() - self.len() >= additional) {
+            return;
+        }
+
+        while test_dbg!(self.capacity() - self.len() < additional) {
             self.grow();
+            let _ = test_dbg!(&self.meta);
         }
     }
 
@@ -325,9 +324,11 @@ impl<T> SegVec<T> {
     }
 
     pub fn push(&mut self, element: T) -> usize {
-        if self.index.is_empty() {
-            todo!("allocate first block");
-        }
+        if self.capacity == 0 {
+            self.initialize(Self::MIN_NON_ZERO_CAP);
+        } else {
+            debug_assert!(self.is_initialized);
+        };
 
         let curr_block_idx = self.index.len() - 1;
         let mut curr_block = &mut self.index[curr_block_idx];
@@ -369,9 +370,46 @@ impl<T> SegVec<T> {
     }
 
     fn grow(&mut self) {
+        if self.capacity == 0 {
+            self.initialize(Self::MIN_NON_ZERO_CAP);
+        } else {
+            debug_assert!(self.is_initialized);
+        };
+
         self.meta.grow();
         self.index.push(Block::new(self.meta.block_cap));
         self.capacity += self.meta.block_cap;
+    }
+
+    fn initialize(&mut self, capacity: usize) {
+        debug_assert!(!self.is_initialized);
+        debug_assert!(capacity.is_power_of_two());
+        debug_assert!(capacity >= Self::MIN_NON_ZERO_CAP);
+
+        // Grow the metadata up to the requested capacity.
+        while test_dbg!(self.meta.block_cap) < capacity {
+            self.meta.grow();
+            self.meta.skipped_blocks += 1;
+            self.meta.skipped_indices += self.meta.block_cap;
+            let _ = test_dbg!(&self.meta);
+        }
+
+        // Build the index, in a vector with enough room for at least the number
+        // of skipped data blocks plus the first actual data block.
+        self.index.reserve(self.meta.skipped_blocks);
+
+        // Grow the metadata again and push the first actual data block.
+        self.meta.grow();
+        self.index.push(Block::new(capacity));
+        debug_assert_eq!(self.meta.block_cap, capacity);
+
+        let _ = test_dbg!(&self.meta);
+
+        #[cfg(debug_assertions)]
+        {
+            self.is_initialized = true;
+        }
+        self.capacity = capacity;
     }
 
     // TODO(eliza): consider making this an API?
@@ -416,12 +454,19 @@ impl<T> Extend<T> for SegVec<T> {
     where
         I: IntoIterator<Item = T>,
     {
-        for item in iter.into_iter() {
+        let iter = iter.into_iter();
+
+        // If the iterator provides a size hint, try to reserve enough capacity
+        // to hold its elements before pushing.
+        let cap = size_hint_capacity(&iter);
+        self.reserve(cap);
+
+        for item in iter {
             self.push(item);
         }
     }
 
-    // TODO(eliza): add `extend_reserve` once that works!
+    // TODO(eliza): add `extend_reserve` once that's stable!
 }
 
 impl<T> FromIterator<T> for SegVec<T> {
@@ -431,17 +476,16 @@ impl<T> FromIterator<T> for SegVec<T> {
     {
         let iter = iter.into_iter();
 
-        // Try to preallocate a block that will fit the entire iterator.
-        let (lower, upper) = iter.size_hint();
-        // If the size hint has an upper bound, use that as the capacity so we
-        // can put all the elements in one block. Otherwise, make the first
-        // block the size hint's lower bound.
-        let cap = upper.unwrap_or(lower);
-
+        // If the iterator provides us with a size hint, try to preallocate the
+        // segvec with enough capacity for the iterator.
+        let cap = size_hint_capacity(&iter);
         // TODO(eliza): we could just use `Vec::collect` and push that as block 1...
         let mut this = Self::with_capacity(cap);
 
-        this.extend(iter);
+        for item in iter.into_iter() {
+            this.push(item);
+        }
+
         this
     }
 }
@@ -528,7 +572,7 @@ impl<T> ExactSizeIterator for IterMut<'_, T> {
 
 impl Meta {
     /// Returns new metadata describing an empty `SegVec`.
-    fn empty() -> Self {
+    const fn empty() -> Self {
         Self {
             len: 0,
             superblock: 0,
@@ -602,11 +646,29 @@ impl<T: fmt::Debug> fmt::Debug for Block<T> {
 #[cfg(test)]
 impl<T: fmt::Debug> fmt::Debug for DebugDetails<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SegVec")
-            .field("meta", &self.0.meta)
-            .field("index", &self.0.index)
-            .finish()
+        let mut f = f.debug_struct("SegVec");
+        f.field("meta", &self.0.meta)
+            .field("capacity", &self.0.capacity)
+            .field("index", &self.0.index);
+        #[cfg(debug_assertions)]
+        {
+            f.field("is_initialized", &self.0.is_initialized);
+        }
+        f.finish()
     }
+}
+
+/// Determine the capacity to preallocate for an iterator, based on its
+/// `size_hint`.
+///
+/// This is used when extending or collecting iterators into a `SegVec`.
+#[inline(always)]
+fn size_hint_capacity(iter: &impl Iterator) -> usize {
+    let (lower, upper) = iter.size_hint();
+    // If the size hint has an upper bound, use that as the capacity so we
+    // can put all the elements in one block. Otherwise, make the first
+    // block the size hint's lower bound.
+    upper.unwrap_or(lower)
 }
 
 #[cfg(test)]
@@ -682,6 +744,7 @@ mod tests {
         #[test]
         fn extend(vec1: Vec<usize>, vec2: Vec<usize>) {
             let mut segvec: SegVec<usize> = SegVec::new();
+            test_dbg!(segvec.debug_details());
 
             // Extend the segvec with elements from vec1.
             segvec.extend(vec1.iter().copied());
