@@ -359,19 +359,16 @@ impl<T> FromIterator<T> for SegVec<T> {
     {
         let iter = iter.into_iter();
 
-        // TODO(eliza): we can't do this until `with_capacity` doesn't break
-        // indexing...
-
-        // // Try to preallocate a block that will fit the entire iterator.
-        // let (lower, upper) = iter.size_hint();
-        // // If the size hint has an upper bound, use that as the capacity so we
-        // // can put all the elements in one block. Otherwise, make the first
-        // // block the size hint's lower bound.
-        // let cap = upper.unwrap_or(lower);
-        // let mut this = Self::with_capacity(cap);
+        // Try to preallocate a block that will fit the entire iterator.
+        let (lower, upper) = iter.size_hint();
+        // If the size hint has an upper bound, use that as the capacity so we
+        // can put all the elements in one block. Otherwise, make the first
+        // block the size hint's lower bound.
+        let cap = upper.unwrap_or(lower);
 
         // TODO(eliza): we could just use `Vec::collect` and push that as block 1...
-        let mut this = Self::new();
+        let mut this = Self::with_capacity(cap);
+
         this.extend(iter);
         this
     }
