@@ -160,7 +160,6 @@ impl<T> SegVec<T> {
         let mut meta = Meta::empty();
 
         // Grow the metadata up to the requested capacity.
-        // TODO(eliza): calculate this rather than looping...
         while test_dbg!(meta.block_cap) < capacity {
             meta.grow();
             meta.skipped_blocks += 1;
@@ -170,13 +169,7 @@ impl<T> SegVec<T> {
 
         // Build the index, in a vector with enough room for at least the number
         // of skipped data blocks plus the first actual data block.
-        let mut index = Vec::with_capacity(meta.skipped_blocks + 1);
-
-        // Backfill the index with empty data blocks for the skipped blocks, as placeholders.
-        // TODO(eliza): let's not actually have to do this...
-        for _ in 0..meta.skipped_blocks {
-            index.push(Block::new(0));
-        }
+        let mut index = Vec::with_capacity(meta.skipped_blocks);
 
         // Grow the metadata again and push the first actual data block.
         meta.grow();
@@ -213,14 +206,17 @@ impl<T> SegVec<T> {
         //   `SB[k]`.
         test_dbg!(let p = (1 << e_bits) + (1 << b_bits) - 2;);
 
+        test_dbg!(let index = p + b - self.meta.skipped_blocks;);
         debug_assert!(
-            p + b < self.index.len(),
-            "assertion failed: p + b < self.index.len(); p={}; b={}; metadata={:?}",
+            index < self.index.len(),
+            "assertion failed: p + b - skipped_blocks < self.index.len(); p={}; b={}; skipped_blocks={}; self.index.len()={}; metadata={:#?}",
             p,
             b,
+            self.meta.skipped_blocks,
+            self.index.len(),
             self.meta,
         );
-        (test_dbg!(p + b), test_dbg!(e))
+        (index, test_dbg!(e))
     }
 
     pub fn len(&self) -> usize {
