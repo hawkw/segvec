@@ -224,6 +224,37 @@ impl<T> SegVec<T> {
         self.meta.len
     }
 
+    /// Reserves capacity for at least `additional` more elements to be inserted
+    /// in the given `SegVec<T>`. The collection may reserve more space to avoid
+    /// frequent reallocations. After calling `reserve`, capacity will be
+    /// greater than or equal to `self.len() + additional`. Does nothing if
+    /// capacity is already sufficient.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the new capacity exceeds `isize::MAX` bytes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use segvec::SegVec;
+    ///
+    /// let mut sv: SegVec<i32> = SegVec::with_capacity(1);
+    /// sv.reserve(10);
+    /// assert!(sv.capacity() >= 11);
+    /// ```
+    pub fn reserve(&mut self, additional: usize) {
+        assert!(additional < isize::MAX as usize);
+
+        if self.capacity() - self.len() >= additional {
+            return;
+        }
+
+        while self.capacity() - self.len() < additional {
+            self.grow();
+        }
+    }
+
     // this code was implemented from a computer science paper lol
     #[allow(clippy::many_single_char_names)]
     fn locate(&self, i: usize) -> (usize, usize) {
@@ -340,6 +371,7 @@ impl<T> SegVec<T> {
     fn grow(&mut self) {
         self.meta.grow();
         self.index.push(Block::new(self.meta.block_cap));
+        self.capacity += self.meta.block_cap;
     }
 
     // TODO(eliza): consider making this an API?
@@ -540,10 +572,9 @@ impl Meta {
 
 impl<T> Block<T> {
     fn new(capacity: usize) -> Self {
-        Self {
-            elements: Vec::with_capacity(capacity),
-            // capacity,
-        }
+        let elements = Vec::with_capacity(capacity);
+        debug_assert_eq!(capacity, elements.capacity());
+        Self { elements }
     }
 
     fn is_full(&self) -> bool {
@@ -581,7 +612,10 @@ impl<T: fmt::Debug> fmt::Debug for DebugDetails<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proptest::{prop_assert_eq, proptest};
+    use proptest::{prop_assert, prop_assert_eq, proptest};
+
+    // Don't try to allocate stupidly big segvecs in proptests. 256kb seems fine.
+    const A_REASONABLE_CAPACITY: usize = (256 * 1024) / mem::size_of::<usize>();
 
     #[test]
     fn push_one_element() {
@@ -643,6 +677,96 @@ mod tests {
             let segvec: SegVec<usize> = vec.iter().cloned().collect();
             let vec2: Vec<usize> = segvec.iter().cloned().collect();
             prop_assert_eq!(&vec, &vec2, "vec={:?}, vec2={:?}, segvec={:#?}", vec, vec2, segvec.debug_details());
+        }
+
+        #[test]
+        fn extend(vec1: Vec<usize>, vec2: Vec<usize>) {
+            let mut segvec: SegVec<usize> = SegVec::new();
+
+            // Extend the segvec with elements from vec1.
+            segvec.extend(vec1.iter().copied());
+            test_dbg!(segvec.debug_details());
+
+            for (i, elem) in vec1.iter().enumerate() {
+                println!("vec1[{}] = {}", i, elem);
+                prop_assert_eq!(&segvec[i], elem);
+            }
+
+            // Extend the segvec with elements from vec2.
+            segvec.extend(vec2.iter().copied());
+            test_dbg!(segvec.debug_details());
+
+            for (i, elem) in vec1.iter().chain(vec2.iter()).enumerate() {
+                println!("vecs[{}] = {}", i, elem);
+                prop_assert_eq!(&segvec[i], elem);
+            }
+        }
+
+        #[test]
+        fn reserve(cap in 0..A_REASONABLE_CAPACITY) {
+            let mut segvec: SegVec<usize> = SegVec::new();
+            segvec.reserve(cap);
+            prop_assert!(
+                segvec.capacity() >= cap,
+                "segvec.capacity() >= cap; cap={}; actual={}; segvec={:#?};",
+                cap, segvec.capacity(), segvec.debug_details(),
+            );
+        }
+
+
+        #[test]
+        fn reserve_with_elements(elems: Vec<usize>, cap in 0..A_REASONABLE_CAPACITY) {
+            let mut segvec: SegVec<usize> = elems.iter().cloned().collect();
+            let len = segvec.len();
+            segvec.reserve(cap);
+            prop_assert!(
+                segvec.capacity() >= (cap + len),
+                "segvec.capacity() >= (cap + len); cap={}; len={}; total={}; \
+                actual={}; segvec={:#?};",
+                cap, len, cap + len, segvec.capacity(), segvec.debug_details(),
+            );
+        }
+
+        #[test]
+        fn reserve_with_capacity(
+            initial_cap in 0..A_REASONABLE_CAPACITY,
+            cap in 0..A_REASONABLE_CAPACITY,
+        ) {
+            let mut segvec: SegVec<usize> = SegVec::with_capacity(initial_cap);
+            segvec.reserve(cap);
+            prop_assert!(
+                segvec.capacity() >= initial_cap,
+                "segvec.capacity() >= initial_cap; initial_cap={}; actual={}; \
+                segvec={:#?};",
+                initial_cap, segvec.capacity(), segvec.debug_details(),
+            );
+            prop_assert!(
+                segvec.capacity() >= cap,
+                "segvec.capacity() >= cap; cap={}; initial_cap={}; actual={}; \
+                segvec={:#?};",
+                cap, initial_cap, segvec.capacity(), segvec.debug_details(),
+            );
+        }
+
+        #[test]
+        fn reserve_twice(
+            cap1 in 0..A_REASONABLE_CAPACITY,
+            cap2 in 0..A_REASONABLE_CAPACITY,
+        ) {
+            let mut segvec: SegVec<usize> = SegVec::new();
+            segvec.reserve(cap1);
+            prop_assert!(
+                segvec.capacity() >= cap1,
+                "segvec.capacity() >= cap1; cap1={}; actual={}; segvec={:#?};",
+                cap1, segvec.capacity(), segvec.debug_details(),
+            );
+
+            segvec.reserve(cap2);
+            prop_assert!(
+                segvec.capacity() >= cap2,
+                "segvec.capacity() >= cap2; cap2={}; actual={}; segvec={:#?};",
+                cap2, segvec.capacity(), segvec.debug_details(),
+            );
         }
     }
 }
