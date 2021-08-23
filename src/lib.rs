@@ -206,17 +206,25 @@ impl<T> SegVec<T> {
         //   `SB[k]`.
         test_dbg!(let p = (1 << e_bits) + (1 << b_bits) - 2;);
 
-        test_dbg!(let index = p + b - self.meta.skipped_blocks;);
+        // 4. Return the location of element `e` in data block `DB[p + b]`.
+        // NOTE: also compensate for skipped low-size blocks.
+        test_dbg!(let data_block = p + b - self.meta.skipped_blocks;);
+
+        // If the data block index is out of bounds, panic with a nicer
+        // assertion with more debugging information.
         debug_assert!(
-            index < self.index.len(),
-            "assertion failed: p + b - skipped_blocks < self.index.len(); p={}; b={}; skipped_blocks={}; self.index.len()={}; metadata={:#?}",
+            data_block < self.index.len(),
+            "assertion failed: data_block < self.index.len(); \
+            data_block={}; self.index.len()={}; p={}; b={}; \
+            metadata={:#?}",
+            data_block,
+            self.index.len(),
             p,
             b,
-            self.meta.skipped_blocks,
-            self.index.len(),
             self.meta,
         );
-        (index, test_dbg!(e))
+
+        (data_block, test_dbg!(e))
     }
 
     pub fn len(&self) -> usize {
