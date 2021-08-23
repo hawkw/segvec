@@ -147,35 +147,43 @@ impl<T> SegVec<T> {
     };
 
     pub fn with_capacity(mut capacity: usize) -> Self {
-        if test_dbg!(!capacity.is_power_of_two()) {
+        // If the requested capacity is not a power of two, round up to the next
+        // power of two.
+        if test_dbg!(capacity > 0 && !capacity.is_power_of_two()) {
             capacity = test_dbg!(capacity.next_power_of_two());
         };
-        capacity = std::cmp::max(capacity, Self::MIN_NON_ZERO_CAP);
-        let _ = test_dbg!(capacity);
+
+        // If the capacity is less than the reasonable minimum capacity for the
+        // size of elements in the `SegVec`, use that capacity instead.
+        test_dbg!(let capacity = std::cmp::max(capacity, Self::MIN_NON_ZERO_CAP););
+
+        let mut meta = Meta::empty();
+
+        // Grow the metadata up to the requested capacity.
         // TODO(eliza): calculate this rather than looping...
-        let mut meta = Meta {
-            len: 0,
-            superblock: 0,
-            sb_cap: 1,
-            sb_len: 0,
-            block_cap: 1,
-            skipped_blocks: 0,
-            skipped_indices: 0,
-        };
         while test_dbg!(meta.block_cap) < capacity {
             meta.grow();
             meta.skipped_blocks += 1;
             meta.skipped_indices += meta.block_cap;
             let _ = test_dbg!(&meta);
         }
+
+        // Build the index, in a vector with enough room for at least the number
+        // of skipped data blocks plus the first actual data block.
         let mut index = Vec::with_capacity(meta.skipped_blocks + 1);
+
+        // Backfill the index with empty data blocks for the skipped blocks, as placeholders.
         // TODO(eliza): let's not actually have to do this...
         for _ in 0..meta.skipped_blocks {
-            index.push(Block::new(capacity));
+            index.push(Block::new(0));
         }
+
+        // Grow the metadata again and push the first actual data block.
         meta.grow();
         index.push(Block::new(capacity));
-        test_dbg!(&meta);
+
+        let _ = test_dbg!(&meta);
+
         Self { meta, index }
     }
 
@@ -446,15 +454,34 @@ impl<T> ExactSizeIterator for IterMut<'_, T> {
 // === impl Meta ===
 
 impl Meta {
-    /// Grow:
-    /// 1. If the last non-empty data block `DB[d-1]` is full:
+    /// Returns new metadata describing an empty `SegVec`.
+    fn empty() -> Self {
+        Self {
+            len: 0,
+            superblock: 0,
+            sb_cap: 1,
+            sb_len: 0,
+            block_cap: 1,
+            skipped_blocks: 0,
+            skipped_indices: 0,
+        }
+    }
+
+    /// Grow the `SegVec` described by this `Meta`.
+    ///
+    /// This does *not* allocate a new data block. Instead, it increments the
+    /// variables tracking the numbers of blocks and superblocks, and increments
+    /// the block size or superblock size, as needed.
+    ///
+    /// This should be called prior to allocating a new data block.
     fn grow(&mut self) {
-        // (a). if the last superblock `SB[s-1]` is full:
+        // 1. If the last non-empty data block `DB[d-1]` is full:
+        //   (a). if the last superblock `SB[s-1]` is full:
         if self.sb_cap == self.sb_len {
             // i. increment `s`
             self.superblock += 1;
             self.sb_len = 0;
-            // ii. if `s` is odd, double the number of data block sin a superblock
+            // ii. if `s` is odd, double the number of data block in a superblock
             if self.superblock % 2 == 0 {
                 self.sb_cap *= 2;
             // iii. otherwise, double the number of elements in a data block.
@@ -463,7 +490,7 @@ impl Meta {
             }
         }
 
-        // (b). if there are no empty data blocks:
+        //   (b). if there are no empty data blocks:
         self.sb_len += 1;
     }
 }
