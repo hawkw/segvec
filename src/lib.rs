@@ -127,6 +127,9 @@ struct Meta {
 
     skipped_blocks: usize,
     skipped_indices: usize,
+
+    /// The current empty data block to push in.
+    empty_data_block: usize,
 }
 
 struct Block<T> {
@@ -330,13 +333,26 @@ impl<T> SegVec<T> {
             debug_assert!(self.is_initialized);
         };
 
-        let curr_block_idx = self.index.len() - 1;
-        let mut curr_block = &mut self.index[curr_block_idx];
+        let mut curr_block = &mut self.index[self.meta.empty_data_block];
+
+        // Is the current block to push in full?
         if curr_block.is_full() {
-            self.grow();
-            curr_block = &mut self.index[curr_block_idx + 1];
+            // Is the current block the last one (e.g. are we out of blocks)?
+            // If so, allocate a new block. Otherwise, we have additional free
+            // blocks to fill (due to `reserve`/`with_capacity`) calls.
+            // NOTE: the Brodnik et al paper doesn't consider that you might
+            //       want to reserve capacity, so this is one of our deviations
+            //       from their algorithm.
+            if self.meta.empty_data_block == self.index.len() - 1 {
+                self.grow();
+            }
+
+            self.meta.empty_data_block += 1;
+            curr_block = &mut self.index[self.meta.empty_data_block];
         }
+
         curr_block.push(element);
+
         let len = self.meta.len;
         self.meta.len += 1;
         len
@@ -581,6 +597,7 @@ impl Meta {
             block_cap: 1,
             skipped_blocks: 0,
             skipped_indices: 0,
+            empty_data_block: 0,
         }
     }
 
