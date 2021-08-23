@@ -24,6 +24,7 @@
 use std::{
     fmt,
     iter::FromIterator,
+    mem,
     ops::{Index, IndexMut},
     slice,
 };
@@ -32,24 +33,27 @@ use std::{
 macro_rules! test_dbg {
     (let $name:ident = $x:expr;) => {
         let $name = $x;
+        let name = stringify!($name);
         eprintln!(
-            "[{}:{}] let {} = {};\t// {}",
+            "[{}:{}] let {} = {:<width$} // {}",
             file!(),
             line!(),
-            stringify!($name),
+            name,
             $name,
-            stringify!($x)
+            stringify!($x),
+            width = 20 - name.len(),
         );
     };
     (let mut $name:ident = $x:expr;) => {
         let mut $name = $x;
         eprintln!(
-            "[{}:{}] let mut {} = {};\t// {}",
+            "[{}:{}] let mut {} = {:<width$} // {}",
             file!(),
             line!(),
-            stringify!($name),
+            name,
             $name,
-            stringify!($x)
+            stringify!($x),
+            width = 16 - name.len(),
         );
     };
     ($x:expr) => {
@@ -71,6 +75,28 @@ macro_rules! test_dbg {
 }
 
 pub struct SegVec<T> {
+    meta: Meta,
+
+    /// The "index block". This holds pointers to the allocated data blocks.
+    index: Vec<Block<T>>,
+}
+
+#[derive(Debug)]
+pub struct Iter<'segvec, T> {
+    len: usize,
+    blocks: slice::Iter<'segvec, Block<T>>,
+    curr_block: slice::Iter<'segvec, T>,
+}
+
+#[derive(Debug)]
+pub struct IterMut<'segvec, T> {
+    len: usize,
+    blocks: slice::IterMut<'segvec, Block<T>>,
+    curr_block: slice::IterMut<'segvec, T>,
+}
+
+#[derive(Debug)]
+struct Meta {
     /// The total number of elements in this `SegVec`.
     ///
     /// This is denoted by _n_ in the paper.
@@ -91,48 +117,66 @@ pub struct SegVec<T> {
     /// The capacity of the blocks in the current superblock.
     block_cap: usize,
 
-    /// The "index block". This holds pointers to the allocated data blocks.
-    index: Vec<Block<T>>,
+    skipped_blocks: usize,
+    skipped_indices: usize,
 }
 
-#[derive(Debug)]
-pub struct Iter<'segvec, T> {
-    len: usize,
-    blocks: slice::Iter<'segvec, Block<T>>,
-    curr_block: slice::Iter<'segvec, T>,
-}
-
-#[derive(Debug)]
-pub struct IterMut<'segvec, T> {
-    len: usize,
-    blocks: slice::IterMut<'segvec, Block<T>>,
-    curr_block: slice::IterMut<'segvec, T>,
+struct Block<T> {
+    elements: Vec<T>,
 }
 
 /// TODO(eliza): consider making this an API?
 #[cfg(test)]
 struct DebugDetails<'segvec, T>(&'segvec SegVec<T>);
 
-struct Block<T> {
-    elements: Vec<T>,
-}
-
 impl<T> SegVec<T> {
     pub fn new() -> Self {
-        // XXX(eliza): blah
-        Self::with_capacity(1)
+        Self::with_capacity(0)
     }
 
-    fn with_capacity(capacity: usize) -> Self {
-        // XXX(eliza): this doesn't actually work for capacities other than 1...
-        Self {
+    // Minimum size of the first data block `Vec`.
+    // This is what `std` will allocate initially if a `Vec` is constructed
+    // without using `with_capacity`.
+    // Copied from https://github.com/rust-lang/rust/blob/996ff2e0a0f911f52bb1de6bdd0cfd5704de1fc9/library/alloc/src/raw_vec.rs#L117-L128
+    const MIN_NON_ZERO_CAP: usize = if mem::size_of::<T>() == 1 {
+        8
+    } else if mem::size_of::<T>() <= 1024 {
+        4
+    } else {
+        1
+    };
+
+    pub fn with_capacity(mut capacity: usize) -> Self {
+        if test_dbg!(!capacity.is_power_of_two()) {
+            capacity = test_dbg!(capacity.next_power_of_two());
+        };
+        capacity = std::cmp::max(capacity, Self::MIN_NON_ZERO_CAP);
+        let _ = test_dbg!(capacity);
+        // TODO(eliza): calculate this rather than looping...
+        let mut meta = Meta {
             len: 0,
             superblock: 0,
             sb_cap: 1,
-            sb_len: 1,
-            block_cap: capacity,
-            index: vec![Block::new(capacity)],
+            sb_len: 0,
+            block_cap: 1,
+            skipped_blocks: 0,
+            skipped_indices: 0,
+        };
+        while test_dbg!(meta.block_cap) < capacity {
+            meta.grow();
+            meta.skipped_blocks += 1;
+            meta.skipped_indices += meta.block_cap;
+            let _ = test_dbg!(&meta);
         }
+        let mut index = Vec::with_capacity(meta.skipped_blocks + 1);
+        // TODO(eliza): let's not actually have to do this...
+        for _ in 0..meta.skipped_blocks {
+            index.push(Block::new(capacity));
+        }
+        meta.grow();
+        index.push(Block::new(capacity));
+        test_dbg!(&meta);
+        Self { meta, index }
     }
 
     // this code was implemented from a computer science paper lol
@@ -144,43 +188,43 @@ impl<T> SegVec<T> {
 
         // 1. Let `r` denote the binary representation of `i + 1`, with all
         //    leading zeroes removed.
-        test_dbg!(let r = i + 1;);
+        test_dbg!(let r = i + 1 + self.meta.skipped_indices;);
         // 2. Note that the desired element `i` is element `e` of data block `b`
         //    of superblock `k`, where:
         //  (a). `k = |r| - 1`
         test_dbg!(let k = BITS2.saturating_sub(r.leading_zeros() as usize););
         //   (c). `e` is the last `ceil(k/2)` bits of `r`.
         test_dbg!(let e_bits = (k + 1) >> 1;);
-        test_dbg!(let e = r & !((-1isize as usize) << e_bits););
+        test_dbg!(let e = r & !(usize::MAX << e_bits););
         test_dbg!(let r = r >> e_bits;);
         //  (b). `b` is the last `floor(k/2)` bits of `r` immediately after the
         //       leading 1-bit
         test_dbg!(let b_bits = k >> 1;);
-        test_dbg!(let b = r & !((-1isize as usize) << b_bits););
+        test_dbg!(let b = r & !(usize::MAX << b_bits););
         // 3. let `p = 2^k - 1` be the number of datablocks in superblocks prior to
         //   `SB[k]`.
         test_dbg!(let p = (1 << e_bits) + (1 << b_bits) - 2;);
 
         debug_assert!(
             p + b < self.index.len(),
-            "assertion failed: p + b < self.index.len(); p={}; b={}; self.index.len()={}",
+            "assertion failed: p + b < self.index.len(); p={}; b={}; metadata={:?}",
             p,
             b,
-            self.index.len()
+            self.meta,
         );
         (test_dbg!(p + b), test_dbg!(e))
     }
 
     pub fn len(&self) -> usize {
-        self.len
+        self.meta.len
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.meta.len == 0
     }
 
     pub fn get(&self, idx: usize) -> Option<&T> {
-        if idx > self.len {
+        if idx > self.meta.len {
             return None;
         }
 
@@ -189,7 +233,7 @@ impl<T> SegVec<T> {
     }
 
     pub fn get_mut(&mut self, idx: usize) -> Option<&mut T> {
-        if idx > self.len {
+        if idx > self.meta.len {
             return None;
         }
 
@@ -209,8 +253,8 @@ impl<T> SegVec<T> {
             curr_block = &mut self.index[curr_block_idx + 1];
         }
         curr_block.push(element);
-        let len = self.len;
-        self.len += 1;
+        let len = self.meta.len;
+        self.meta.len += 1;
         len
     }
 
@@ -241,29 +285,13 @@ impl<T> SegVec<T> {
         }
     }
 
-    /// Grow:
-    /// 1. If the last non-empty data block `DB[d-1]` is full:
     fn grow(&mut self) {
-        // (a). if the last superblock `SB[s-1]` is full:
-        if self.sb_cap == self.sb_len {
-            // i. increment `s`
-            self.superblock += 1;
-            self.sb_len = 0;
-            // ii. if `s` is odd, double the number of data block sin a superblock
-            if self.superblock % 2 == 0 {
-                self.sb_cap *= 2;
-            // iii. otherwise, double the number of elements in a data block.
-            } else {
-                self.block_cap *= 2;
-            }
-        }
-
-        // (b). if there are no empty data blocks:
-        self.index.push(Block::new(self.block_cap));
-        self.sb_len += 1;
+        self.meta.grow();
+        self.index.push(Block::new(self.meta.block_cap));
     }
 
-    #[cfg(test)] // TODO(eliza): consider making this an API?
+    // TODO(eliza): consider making this an API?
+    #[cfg(test)]
     fn debug_details(&self) -> DebugDetails<'_, T> {
         DebugDetails(self)
     }
@@ -288,7 +316,7 @@ impl<T> Index<usize> for SegVec<T> {
 impl<T> IndexMut<usize> for SegVec<T> {
     #[track_caller]
     fn index_mut(&mut self, idx: usize) -> &mut Self::Output {
-        let len = self.len;
+        let len = self.meta.len;
         match self.get_mut(idx) {
             None => panic!(
                 "SegVec index out of bounds: the len is {} but the index is {}",
@@ -310,12 +338,6 @@ impl<T> Extend<T> for SegVec<T> {
     }
 
     // TODO(eliza): add `extend_reserve` once that works!
-}
-
-impl<T: fmt::Debug> fmt::Debug for SegVec<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_list().entries(self.iter()).finish()
-    }
 }
 
 impl<T> FromIterator<T> for SegVec<T> {
@@ -360,6 +382,19 @@ impl<'segvec, T> IntoIterator for &'segvec mut SegVec<T> {
         self.iter_mut()
     }
 }
+
+impl<T: fmt::Debug> fmt::Debug for SegVec<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+impl<T> Default for SegVec<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // === impl Iter ===
 
 impl<'segvec, T> Iterator for Iter<'segvec, T> {
@@ -408,6 +443,31 @@ impl<T> ExactSizeIterator for IterMut<'_, T> {
     }
 }
 
+// === impl Meta ===
+
+impl Meta {
+    /// Grow:
+    /// 1. If the last non-empty data block `DB[d-1]` is full:
+    fn grow(&mut self) {
+        // (a). if the last superblock `SB[s-1]` is full:
+        if self.sb_cap == self.sb_len {
+            // i. increment `s`
+            self.superblock += 1;
+            self.sb_len = 0;
+            // ii. if `s` is odd, double the number of data block sin a superblock
+            if self.superblock % 2 == 0 {
+                self.sb_cap *= 2;
+            // iii. otherwise, double the number of elements in a data block.
+            } else {
+                self.block_cap *= 2;
+            }
+        }
+
+        // (b). if there are no empty data blocks:
+        self.sb_len += 1;
+    }
+}
+
 // === impl Block ==
 
 impl<T> Block<T> {
@@ -440,15 +500,11 @@ impl<T: fmt::Debug> fmt::Debug for Block<T> {
 
 // === impl DebugDetails ===
 
-#[cfg(test)] // TODO(eliza): consider making this an API?
+#[cfg(test)]
 impl<T: fmt::Debug> fmt::Debug for DebugDetails<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SegVec")
-            .field("len", &self.0.len())
-            .field("superblock", &self.0.superblock)
-            .field("sb_cap", &self.0.sb_cap)
-            .field("sb_len", &self.0.sb_len)
-            .field("block_cap", &self.0.block_cap)
+            .field("meta", &self.0.meta)
             .field("index", &self.0.index)
             .finish()
     }
@@ -461,7 +517,14 @@ mod tests {
 
     #[test]
     fn push_one_element() {
-        let mut segvec = SegVec::with_capacity(1);
+        let mut segvec = SegVec::new();
+        dbg!(&mut segvec).push(1);
+        assert_eq!(dbg!(segvec)[0], 1);
+    }
+
+    #[test]
+    fn push_one_element_with_capacity() {
+        let mut segvec = SegVec::with_capacity(64);
         dbg!(&mut segvec).push(1);
         assert_eq!(dbg!(segvec)[0], 1);
     }
@@ -473,11 +536,33 @@ mod tests {
                 return Ok(());
             }
 
-            let mut segvec = SegVec::with_capacity(1);
+            let mut segvec = SegVec::new();
             for (i, elem) in vec.iter().enumerate() {
                 let pushed_idx = segvec.push(elem);
                 prop_assert_eq!(pushed_idx, i, "   vec={:?}\nsegvec={:#?}", vec, segvec.debug_details());
             }
+
+            test_dbg!(segvec.debug_details());
+
+            for (i, elem) in vec.iter().enumerate() {
+                println!("vec[{}] = {}", i, elem);
+                prop_assert_eq!(segvec[i], elem, "i={}\n   vec={:?}\nsegvec={:#?}", i, vec, segvec.debug_details())
+            }
+        }
+
+        #[test]
+        fn indexing_basically_works_with_capacity(capacity in 0usize..1024, vec: Vec<usize>) {
+            if vec.is_empty() {
+                return Ok(());
+            }
+
+            let mut segvec = SegVec::with_capacity(capacity);
+            for (i, elem) in vec.iter().enumerate() {
+                let pushed_idx = segvec.push(elem);
+                prop_assert_eq!(pushed_idx, i, "   vec={:?}\nsegvec={:#?}", vec, segvec.debug_details());
+            }
+
+            test_dbg!(segvec.debug_details());
 
             for (i, elem) in vec.iter().enumerate() {
                 println!("vec[{}] = {}", i, elem);
