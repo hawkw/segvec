@@ -77,6 +77,11 @@ macro_rules! test_dbg {
 pub struct SegVec<T> {
     meta: Meta,
 
+    /// The total capacity of the `SegVec`. This _includes_ used capacity.
+    ///
+    /// This should always be >= `self.len()`.
+    capacity: usize,
+
     /// The "index block". This holds pointers to the allocated data blocks.
     index: Vec<Block<T>>,
 }
@@ -174,10 +179,49 @@ impl<T> SegVec<T> {
         // Grow the metadata again and push the first actual data block.
         meta.grow();
         index.push(Block::new(capacity));
+        debug_assert_eq!(meta.block_cap, capacity);
 
         let _ = test_dbg!(&meta);
 
-        Self { meta, index }
+        Self {
+            meta,
+            index,
+            capacity,
+        }
+    }
+
+    /// Returns the number of elements the `SegVec` can hold without
+    /// reallocating.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use segvec::SegVec;
+    ///
+    /// let sv: SegVec<i32> = SegVec::with_capacity(10);
+    /// assert!(sv.capacity() >= 10);
+    /// ```
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Returns the number of elements in the `SegVec`, also referred to
+    /// as its 'length'.
+    ///
+    /// # Examples
+    ///
+    // TODO(eliza): fix this example.
+    /// ```ignore
+    /// use segvec::segvec;
+    ///
+    /// let sv = segvec![1, 2, 3];
+    /// assert_eq!(a.len(), 3);
+    /// ```
+    #[doc(alias = "length")]
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.meta.len
     }
 
     // this code was implemented from a computer science paper lol
@@ -225,10 +269,6 @@ impl<T> SegVec<T> {
         );
 
         (data_block, test_dbg!(e))
-    }
-
-    pub fn len(&self) -> usize {
-        self.meta.len
     }
 
     pub fn is_empty(&self) -> bool {
