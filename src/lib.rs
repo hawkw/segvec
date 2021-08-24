@@ -113,40 +113,43 @@ struct Meta {
     /// This is denoted by _n_ in the paper.
     len: usize,
 
-    /// Current superblock index.
-    superblock: usize,
+    // /// Current superblock index.
+    // superblock: usize,
 
-    /// The capacity of the current superblock.
-    ///
-    /// When the superblock has `sb_cap` blocks in it, allocating a new block
-    /// will increment the superblock index and reset `sb_cap`.
-    sb_cap: usize,
+    // /// The capacity of the current superblock.
+    // ///
+    // /// When the superblock has `sb_cap` blocks in it, allocating a new block
+    // /// will increment the superblock index and reset `sb_cap`.
+    // sb_cap: usize,
 
-    /// The current number of blocks in the current superblock.
-    sb_len: usize,
-
+    // /// The current number of blocks in the current superblock.
+    // sb_len: usize,
     /// The capacity of the blocks in the current superblock.
-    block_cap: usize,
+    // block_cap: usize,
+    // log_block_cap: usize,
 
-    skipped_blocks: usize,
-    skipped_indices: usize,
-
+    // skipped_blocks: usize,
+    // skipped_indices: usize,
     /// The current empty data block to push in.
     empty_data_block: usize,
+    // mult: usize,
+    initial_cap: usize,
+    block_cap: usize,
+    block_shift: usize,
 }
 
 struct Block<T> {
     elements: Vec<T>,
+    prev_cap: usize,
 }
 
 /// TODO(eliza): consider making this an API?
-#[cfg(test)]
-struct DebugDetails<'segvec, T>(&'segvec SegVec<T>);
+pub struct DebugDetails<'segvec, T>(&'segvec SegVec<T>);
 
 impl<T> SegVec<T> {
     pub const fn new() -> Self {
         Self {
-            meta: Meta::empty(),
+            meta: Meta::with_capacity(Self::MIN_NON_ZERO_CAP),
             index: Vec::new(),
             capacity: 0,
             #[cfg(debug_assertions)]
@@ -166,9 +169,24 @@ impl<T> SegVec<T> {
         1
     };
 
-    pub fn with_capacity(capacity: usize) -> Self {
-        let mut this = Self::new();
-        this.reserve(capacity);
+    pub fn with_capacity(mut capacity: usize) -> Self {
+        // If the requested capacity is not a power of two, round up to the next
+        // power of two.
+        if test_dbg!(!capacity.is_power_of_two()) {
+            capacity = test_dbg!(capacity.next_power_of_two());
+        };
+
+        // If the capacity is less than the reasonable minimum capacity for the
+        // size of elements in the `SegVec`, use that capacity instead.
+        test_dbg!(let capacity = cmp::max(capacity, Self::MIN_NON_ZERO_CAP););
+        let mut this = Self {
+            meta: Meta::with_capacity(capacity),
+            index: Vec::with_capacity(cmp::max(capacity, 64)),
+            capacity: 0,
+            #[cfg(debug_assertions)]
+            is_initialized: true,
+        };
+        this.grow();
         this
     }
 
@@ -225,33 +243,10 @@ impl<T> SegVec<T> {
     /// sv.reserve(10);
     /// assert!(sv.capacity() >= 11);
     /// ```
-    pub fn reserve(&mut self, mut additional: usize) {
+    pub fn reserve(&mut self, additional: usize) {
         assert!(additional < isize::MAX as usize);
 
         if additional == 0 {
-            return;
-        }
-
-        if self.capacity == 0 {
-            // If the requested capacity is not a power of two, round up to the next
-            // power of two.
-            if test_dbg!(!additional.is_power_of_two()) {
-                additional = test_dbg!(additional.next_power_of_two());
-            };
-
-            // If the capacity is less than the reasonable minimum capacity for the
-            // size of elements in the `SegVec`, use that capacity instead.
-            test_dbg!(let additional = cmp::max(additional, Self::MIN_NON_ZERO_CAP););
-            self.initialize(additional);
-            return;
-        }
-
-        #[cfg(debug_assertions)]
-        debug_assert!(self.is_initialized);
-
-        let _ = test_dbg!((self.capacity(), self.len(), additional));
-
-        if test_dbg!(self.capacity() - self.len() >= additional) {
             return;
         }
 
@@ -263,49 +258,52 @@ impl<T> SegVec<T> {
 
     // this code was implemented from a computer science paper lol
     #[allow(clippy::many_single_char_names)]
-    fn locate(&self, i: usize) -> (usize, usize) {
-        const BITS2: usize = (usize::BITS - 1) as usize;
-        // TODO(eliza): it is almost certainly possible to optimize this using
-        // the `log2` of the current block size...
+    fn locate(&self, i: usize) -> usize {
+        // const BITS2: usize = (usize::BITS - 1) as usize;
+        // // TODO(eliza): it is almost certainly possible to optimize this using
+        // // the `log2` of the current block size...
 
-        // 1. Let `r` denote the binary representation of `i + 1`, with all
-        //    leading zeroes removed.
-        test_dbg!(let r = i + 1 + self.meta.skipped_indices;);
-        // 2. Note that the desired element `i` is element `e` of data block `b`
-        //    of superblock `k`, where:
-        //  (a). `k = |r| - 1`
-        test_dbg!(let k = BITS2.saturating_sub(r.leading_zeros() as usize););
-        //   (c). `e` is the last `ceil(k/2)` bits of `r`.
-        test_dbg!(let e_bits = (k + 1) >> 1;);
-        test_dbg!(let e = r & !(usize::MAX << e_bits););
-        test_dbg!(let r = r >> e_bits;);
-        //  (b). `b` is the last `floor(k/2)` bits of `r` immediately after the
-        //       leading 1-bit
-        test_dbg!(let b_bits = k >> 1;);
-        test_dbg!(let b = r & !(usize::MAX << b_bits););
-        // 3. let `p = 2^k - 1` be the number of datablocks in superblocks prior to
-        //   `SB[k]`.
-        test_dbg!(let p = (1 << e_bits) + (1 << b_bits) - 2;);
+        // // 1. Let `r` denote the binary representation of `i + 1`, with all
+        // //    leading zeroes removed.
+        // test_dbg!(let r = i + 1 + self.meta.skipped_indices;);
+        // // 2. Note that the desired element `i` is element `e` of data block `b`
+        // //    of superblock `k`, where:
+        // //  (a). `k = |r| - 1`
+        // test_dbg!(let k = BITS2.saturating_sub(r.leading_zeros() as usize););
+        // //   (c). `e` is the last `ceil(k/2)` bits of `r`.
+        // test_dbg!(let e_bits = (k + 1) >> 1;);
+        // test_dbg!(let e = r & !(usize::MAX << e_bits););
+        // test_dbg!(let r = r >> e_bits;);
+        // //  (b). `b` is the last `floor(k/2)` bits of `r` immediately after the
+        // //       leading 1-bit
+        // test_dbg!(let b_bits = k >> 1;);
+        // test_dbg!(let b = r & !(usize::MAX << b_bits););
+        // // 3. let `p = 2^k - 1` be the number of datablocks in superblocks prior to
+        // //   `SB[k]`.
+        // test_dbg!(let p = (1 << e_bits) + (1 << b_bits) - 2;);
 
-        // 4. Return the location of element `e` in data block `DB[p + b]`.
-        // NOTE: also compensate for skipped low-size blocks.
-        test_dbg!(let data_block = p + b - self.meta.skipped_blocks;);
+        // // 4. Return the location of element `e` in data block `DB[p + b]`.
+        // // NOTE: also compensate for skipped low-size blocks.
+        // test_dbg!(let data_block = p + b - self.meta.skipped_blocks;);
 
-        // If the data block index is out of bounds, panic with a nicer
-        // assertion with more debugging information.
-        debug_assert!(
-            data_block < self.index.len(),
-            "assertion failed: data_block < self.index.len(); \
-            data_block={}; self.index.len()={}; p={}; b={}; \
-            metadata={:#?}",
-            data_block,
-            self.index.len(),
-            p,
-            b,
-            self.meta,
-        );
+        // // If the data block index is out of bounds, panic with a nicer
+        // // assertion with more debugging information.
+        // debug_assert!(
+        //     data_block < self.index.len(),
+        //     "assertion failed: data_block < self.index.len(); \
+        //     data_block={}; self.index.len()={}; p={}; b={}; \
+        //     metadata={:#?}",
+        //     data_block,
+        //     self.index.len(),
+        //     p,
+        //     b,
+        //     self.meta,
+        // );
 
-        (data_block, test_dbg!(e))
+        // (data_block, test_dbg!(e))
+        test_dbg!(let block_shifted = (i + self.meta.initial_cap) >> self.meta.block_shift;);
+        test_dbg!(let block = (usize::BITS - block_shifted.leading_zeros()) as usize;);
+        block
     }
 
     pub fn is_empty(&self) -> bool {
@@ -317,8 +315,7 @@ impl<T> SegVec<T> {
             return None;
         }
 
-        let (block, idx) = self.locate(idx);
-        self.index.get(block)?.elements.get(idx)
+        self.index.get(self.locate(idx))?.get(idx)
     }
 
     pub fn get_mut(&mut self, idx: usize) -> Option<&mut T> {
@@ -326,17 +323,14 @@ impl<T> SegVec<T> {
             return None;
         }
 
-        let (block, idx) = self.locate(idx);
-        self.index.get_mut(block)?.elements.get_mut(idx)
+        let block = self.locate(idx);
+        self.index.get_mut(block)?.get_mut(idx)
     }
 
     pub fn push(&mut self, element: T) -> usize {
-        if self.capacity == 0 {
-            self.initialize(Self::MIN_NON_ZERO_CAP);
-        } else {
-            #[cfg(debug_assertions)]
-            debug_assert!(self.is_initialized);
-        };
+        if self.capacity == self.meta.len {
+            self.grow()
+        }
 
         let mut curr_block = &mut self.index[self.meta.empty_data_block];
 
@@ -348,10 +342,6 @@ impl<T> SegVec<T> {
             // NOTE: the Brodnik et al paper doesn't consider that you might
             //       want to reserve capacity, so this is one of our deviations
             //       from their algorithm.
-            if self.meta.empty_data_block == self.index.len() - 1 {
-                self.grow();
-            }
-
             self.meta.empty_data_block += 1;
             curr_block = &mut self.index[self.meta.empty_data_block];
         }
@@ -391,53 +381,18 @@ impl<T> SegVec<T> {
     }
 
     fn grow(&mut self) {
-        if self.capacity == 0 {
-            self.initialize(Self::MIN_NON_ZERO_CAP);
+        if self.capacity != 0 {
+            self.meta.grow();
         } else {
-            #[cfg(debug_assertions)]
-            debug_assert!(self.is_initialized);
-        };
-
-        self.meta.grow();
-        self.index.push(Block::new(self.meta.block_cap));
+            self.index.reserve(64);
+        }
+        self.index
+            .push(Block::new(self.meta.block_cap, self.capacity));
         self.capacity += self.meta.block_cap;
     }
 
-    fn initialize(&mut self, capacity: usize) {
-        #[cfg(debug_assertions)]
-        debug_assert!(!self.is_initialized);
-        debug_assert!(capacity.is_power_of_two());
-        debug_assert!(capacity >= Self::MIN_NON_ZERO_CAP);
-
-        // Grow the metadata up to the requested capacity.
-        while test_dbg!(self.meta.block_cap) < capacity {
-            self.meta.grow();
-            self.meta.skipped_blocks += 1;
-            self.meta.skipped_indices += self.meta.block_cap;
-            let _ = test_dbg!(&self.meta);
-        }
-
-        // Build the index, in a vector with enough room for at least the number
-        // of skipped data blocks plus the first actual data block.
-        self.index.reserve(self.meta.skipped_blocks);
-
-        // Grow the metadata again and push the first actual data block.
-        self.meta.grow();
-        self.index.push(Block::new(capacity));
-        debug_assert_eq!(self.meta.block_cap, capacity);
-
-        let _ = test_dbg!(&self.meta);
-
-        #[cfg(debug_assertions)]
-        {
-            self.is_initialized = true;
-        }
-        self.capacity = capacity;
-    }
-
     // TODO(eliza): consider making this an API?
-    #[cfg(test)]
-    fn debug_details(&self) -> DebugDetails<'_, T> {
+    pub fn debug_details(&self) -> DebugDetails<'_, T> {
         DebugDetails(self)
     }
 }
@@ -595,16 +550,22 @@ impl<T> ExactSizeIterator for IterMut<'_, T> {
 
 impl Meta {
     /// Returns new metadata describing an empty `SegVec`.
-    const fn empty() -> Self {
+    const fn with_capacity(capacity: usize) -> Self {
+        // let log_block_cap = usize::BITS as usize - capacity.leading_zeros() as usize - 1;
         Self {
             len: 0,
-            superblock: 0,
-            sb_cap: 1,
-            sb_len: 0,
-            block_cap: 1,
-            skipped_blocks: 0,
-            skipped_indices: 0,
             empty_data_block: 0,
+            block_cap: capacity,
+            initial_cap: capacity,
+            block_shift: capacity.trailing_zeros() as usize + 1,
+            // mult: 0b01,
+            // superblock: 0,
+            // sb_cap: 1,
+            // sb_len: 0,
+            // block_cap: 1,
+            // skipped_blocks: 0,
+            // skipped_indices: 0,
+            // empty_data_block: 0,
         }
     }
 
@@ -616,33 +577,40 @@ impl Meta {
     ///
     /// This should be called prior to allocating a new data block.
     fn grow(&mut self) {
-        // 1. If the last non-empty data block `DB[d-1]` is full:
-        //   (a). if the last superblock `SB[s-1]` is full:
-        if self.sb_cap == self.sb_len {
-            // i. increment `s`
-            self.superblock += 1;
-            self.sb_len = 0;
-            // ii. if `s` is odd, double the number of data block in a superblock
-            if self.superblock % 2 == 0 {
-                self.sb_cap *= 2;
-            // iii. otherwise, double the number of elements in a data block.
-            } else {
-                self.block_cap *= 2;
-            }
-        }
+        let _ = test_dbg!(&self);
+        // test_dbg!(let mult = self.mult & 0b1;);
+        // // self.block_cap *= mult;
+        // self.log_block_cap += mult;
+        // self.mult = !self.mult;
+        self.block_cap <<= 1;
+        let _ = test_dbg!(&self);
+        // // 1. If the last non-empty data block `DB[d-1]` is full:
+        // //   (a). if the last superblock `SB[s-1]` is full:
+        // if self.sb_cap == self.sb_len {
+        //     // i. increment `s`
+        //     self.superblock += 1;
+        //     self.sb_len = 0;
+        //     // ii. if `s` is odd, double the number of data block in a superblock
+        //     if self.superblock % 2 == 0 {
+        //         self.sb_cap *= 2;
+        //     // iii. otherwise, double the number of elements in a data block.
+        //     } else {
+        //         self.block_cap *= 2;
+        //     }
+        // }
 
-        //   (b). if there are no empty data blocks:
-        self.sb_len += 1;
+        // //   (b). if there are no empty data blocks:
+        // self.sb_len += 1;
     }
 }
 
 // === impl Block ==
 
 impl<T> Block<T> {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, prev_cap: usize) -> Self {
         let elements = Vec::with_capacity(capacity);
         debug_assert_eq!(capacity, elements.capacity());
-        Self { elements }
+        Self { elements, prev_cap }
     }
 
     fn is_full(&self) -> bool {
@@ -653,6 +621,16 @@ impl<T> Block<T> {
         debug_assert!(!self.is_full(), "Block vectors should never reallocate");
         self.elements.push(element);
     }
+
+    #[inline(always)]
+    fn get(&self, idx: usize) -> Option<&T> {
+        self.elements.get(test_dbg!(idx - self.prev_cap))
+    }
+
+    #[inline(always)]
+    fn get_mut(&mut self, idx: usize) -> Option<&mut T> {
+        self.elements.get_mut(test_dbg!(idx - self.prev_cap))
+    }
 }
 
 impl<T: fmt::Debug> fmt::Debug for Block<T> {
@@ -660,6 +638,7 @@ impl<T: fmt::Debug> fmt::Debug for Block<T> {
         f.debug_struct("Block")
             .field("len", &self.elements.len())
             .field("capacity", &self.elements.capacity())
+            .field("prev_cap", &self.prev_cap)
             .field("elements", &self.elements)
             .finish()
     }
@@ -667,7 +646,7 @@ impl<T: fmt::Debug> fmt::Debug for Block<T> {
 
 // === impl DebugDetails ===
 
-#[cfg(test)]
+// #[cfg(test)]
 impl<T: fmt::Debug> fmt::Debug for DebugDetails<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut f = f.debug_struct("SegVec");
