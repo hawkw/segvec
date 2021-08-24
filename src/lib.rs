@@ -246,6 +246,7 @@ impl<T> SegVec<T> {
             return;
         }
 
+        #[cfg(debug_assertions)]
         debug_assert!(self.is_initialized);
 
         let _ = test_dbg!((self.capacity(), self.len(), additional));
@@ -333,6 +334,7 @@ impl<T> SegVec<T> {
         if self.capacity == 0 {
             self.initialize(Self::MIN_NON_ZERO_CAP);
         } else {
+            #[cfg(debug_assertions)]
             debug_assert!(self.is_initialized);
         };
 
@@ -392,6 +394,7 @@ impl<T> SegVec<T> {
         if self.capacity == 0 {
             self.initialize(Self::MIN_NON_ZERO_CAP);
         } else {
+            #[cfg(debug_assertions)]
             debug_assert!(self.is_initialized);
         };
 
@@ -401,6 +404,7 @@ impl<T> SegVec<T> {
     }
 
     fn initialize(&mut self, capacity: usize) {
+        #[cfg(debug_assertions)]
         debug_assert!(!self.is_initialized);
         debug_assert!(capacity.is_power_of_two());
         debug_assert!(capacity >= Self::MIN_NON_ZERO_CAP);
