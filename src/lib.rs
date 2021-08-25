@@ -22,11 +22,11 @@
 //!   _iterate_ over ranges of a `SegVec`, but you cannot obtain a slice of data
 //!   in a `SegVec`. If you need to slice your vector, you can't use this.
 use std::{
-    cmp, fmt,
+    alloc, cmp, fmt,
     iter::FromIterator,
     mem,
     ops::{Index, IndexMut},
-    slice,
+    ptr, slice,
 };
 
 #[cfg(test)]
@@ -138,8 +138,11 @@ struct Meta {
     block_shift: usize,
 }
 
+#[derive(Debug)]
 struct Block<T> {
-    elements: Vec<T>,
+    ptr: ptr::NonNull<T>,
+    cap: usize,
+    len: usize,
     prev_cap: usize,
 }
 
@@ -357,7 +360,7 @@ impl<T> SegVec<T> {
         let mut blocks = self.index.iter();
         let curr_block = blocks
             .next()
-            .map(|block| block.elements.iter())
+            .map(|block| block.as_slice().iter())
             .unwrap_or_else(|| [].iter());
         Iter {
             len: self.len(),
@@ -371,7 +374,7 @@ impl<T> SegVec<T> {
         let mut blocks = self.index.iter_mut();
         let curr_block = blocks
             .next()
-            .map(|block| block.elements.iter_mut())
+            .map(|block| block.as_mut_slice().iter_mut())
             .unwrap_or_else(|| [].iter_mut());
         IterMut {
             len,
@@ -507,7 +510,7 @@ impl<'segvec, T> Iterator for Iter<'segvec, T> {
             if let Some(elem) = self.curr_block.next() {
                 return Some(elem);
             }
-            self.curr_block = self.blocks.next()?.elements.iter();
+            self.curr_block = self.blocks.next()?.as_slice().iter();
         }
     }
 
@@ -531,7 +534,7 @@ impl<'segvec, T> Iterator for IterMut<'segvec, T> {
             if let Some(elem) = self.curr_block.next() {
                 return Some(elem);
             }
-            self.curr_block = self.blocks.next()?.elements.iter_mut();
+            self.curr_block = self.blocks.next()?.as_mut_slice().iter_mut();
         }
     }
 
@@ -607,42 +610,108 @@ impl Meta {
 // === impl Block ==
 
 impl<T> Block<T> {
-    fn new(capacity: usize, prev_cap: usize) -> Self {
-        let elements = Vec::with_capacity(capacity);
-        debug_assert_eq!(capacity, elements.capacity());
-        Self { elements, prev_cap }
+    fn new(cap: usize, prev_cap: usize) -> Self {
+        // TODO(eliza): when `alloc_api` stuff stabilizes, this can do what
+        // rawvec does...
+        let ptr = unsafe {
+            let ptr = alloc::alloc(alloc::Layout::array::<T>(cap).expect("invalid layout"));
+            ptr::NonNull::new(ptr)
+                .expect("failed to allocate block!")
+                .cast()
+        };
+        Self {
+            ptr,
+            len: 0,
+            cap,
+            prev_cap,
+        }
     }
 
     fn is_full(&self) -> bool {
-        self.elements.capacity() == self.elements.len()
+        self.len == self.cap
     }
 
+    // #[inline]
     fn push(&mut self, element: T) {
-        debug_assert!(!self.is_full(), "Block vectors should never reallocate");
-        self.elements.push(element);
+        debug_assert!(!self.is_full());
+        unsafe {
+            let end = self.ptr.as_ptr().add(self.len);
+            ptr::write(end, element);
+            self.len += 1;
+        }
     }
 
-    #[inline(always)]
+    #[inline]
+    fn pop(&mut self) -> Option<T> {
+        debug_assert!(self.len <= self.cap);
+        if self.len == 0 {
+            None
+        } else {
+            unsafe {
+                self.len -= 1;
+                Some(ptr::read(self.ptr.as_ptr().add(self.len)))
+            }
+        }
+    }
+
+    #[inline]
     fn get(&self, idx: usize) -> Option<&T> {
-        self.elements.get(test_dbg!(idx - self.prev_cap))
+        debug_assert!(self.len < self.cap);
+        if idx >= self.len {
+            return None;
+        }
+
+        unsafe { Some(&*(self.ptr.as_ptr() as *const T).add(idx)) }
     }
 
-    #[inline(always)]
+    #[inline]
     fn get_mut(&mut self, idx: usize) -> Option<&mut T> {
-        self.elements.get_mut(test_dbg!(idx - self.prev_cap))
+        debug_assert!(self.len < self.cap);
+        if idx >= self.len {
+            return None;
+        }
+
+        unsafe { Some(&mut *(self.ptr.as_ptr()).add(idx)) }
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[T] {
+        debug_assert!(self.len < self.cap);
+        unsafe { &*ptr::slice_from_raw_parts(self.ptr.as_ptr() as *const _, self.len) }
+    }
+
+    #[inline]
+    fn as_mut_slice(&mut self) -> &mut [T] {
+        debug_assert!(self.len < self.cap);
+        unsafe { &mut *ptr::slice_from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 }
 
-impl<T: fmt::Debug> fmt::Debug for Block<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Block")
-            .field("len", &self.elements.len())
-            .field("capacity", &self.elements.capacity())
-            .field("prev_cap", &self.prev_cap)
-            .field("elements", &self.elements)
-            .finish()
+impl<T> Drop for Block<T> {
+    fn drop(&mut self) {
+        unsafe {
+            // use drop for [T]
+            // use a raw slice to refer to the elements of the vector as weakest necessary type;
+            // could avoid questions of validity in certain cases
+            ptr::drop_in_place(ptr::slice_from_raw_parts_mut(self.ptr.as_ptr(), self.len));
+            alloc::dealloc(
+                self.ptr.as_ptr().cast(),
+                alloc::Layout::array::<T>(self.cap)
+                    .expect("must have been valid to allocate block"),
+            )
+        }
     }
 }
+// impl<T: fmt::Debug> fmt::Debug for Block<T> {
+//     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+//         f.debug_struct("Block")
+//             .field("len", &self.len())
+//             .field("capacity", &self.elements.capacity())
+//             .field("prev_cap", &self.prev_cap)
+//             .field("elements", &self.elements)
+//             .finish()
+//     }
+// }
 
 // === impl DebugDetails ===
 

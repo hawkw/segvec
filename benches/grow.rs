@@ -1,8 +1,8 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use segvec::SegVec;
 
-const SIZES: &[usize] = &[2, 32, 64, 256, 1024, 2048, 4096];
-const SOME_DATA: &[&str] = &["hello world"; 4096];
+const SIZES: &[usize] = &[100, 500, 1000, 5000, 10000, 50000];
+const SOME_DATA: &[&str] = &["hello world"; 50000];
 
 fn bench_extend(c: &mut Criterion) {
     let mut group = c.benchmark_group("extend_twice");
@@ -75,5 +75,5 @@ fn bench_push(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_extend, bench_push, bench_collect);
+criterion_group!(benches, bench_push,);
 criterion_main!(benches);
