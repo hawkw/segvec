@@ -24,7 +24,7 @@
 use std::{
     alloc, cmp, fmt,
     iter::FromIterator,
-    mem,
+    mem::{self, MaybeUninit},
     ops::{Index, IndexMut},
     ptr, slice,
 };
@@ -88,8 +88,7 @@ pub struct SegVec<T> {
     /// The "index block". This holds pointers to the allocated data blocks.
     index: Vec<Block<T>>,
 
-    #[cfg(debug_assertions)]
-    is_initialized: bool,
+    first_empty_block: Option<ptr::NonNull<Block<T>>>,
 }
 
 #[derive(Debug)]
@@ -138,7 +137,6 @@ struct Meta {
     block_shift: usize,
 }
 
-#[derive(Debug)]
 struct Block<T> {
     ptr: ptr::NonNull<T>,
     cap: usize,
@@ -155,8 +153,7 @@ impl<T> SegVec<T> {
             meta: Meta::with_capacity(Self::MIN_NON_ZERO_CAP),
             index: Vec::new(),
             capacity: 0,
-            #[cfg(debug_assertions)]
-            is_initialized: false,
+            first_empty_block: None,
         }
     }
 
@@ -186,8 +183,7 @@ impl<T> SegVec<T> {
             meta: Meta::with_capacity(capacity),
             index: Vec::with_capacity(cmp::max(capacity, 64)),
             capacity: 0,
-            #[cfg(debug_assertions)]
-            is_initialized: true,
+            first_empty_block: None,
         };
         this.grow();
         this
@@ -331,25 +327,19 @@ impl<T> SegVec<T> {
     }
 
     pub fn push(&mut self, element: T) -> usize {
-        if self.capacity == self.meta.len {
-            self.grow()
-        }
+        let block = loop {
+            match self.first_empty_block.as_mut() {
+                Some(block) => unsafe {
+                    break block.as_mut();
+                },
+                None => self.grow(),
+            };
+        };
 
-        let mut curr_block = &mut self.index[self.meta.empty_data_block];
-
-        // Is the current block to push in full?
-        if curr_block.is_full() {
-            // Is the current block the last one (e.g. are we out of blocks)?
-            // If so, allocate a new block. Otherwise, we have additional free
-            // blocks to fill (due to `reserve`/`with_capacity`) calls.
-            // NOTE: the Brodnik et al paper doesn't consider that you might
-            //       want to reserve capacity, so this is one of our deviations
-            //       from their algorithm.
+        if dbg!(block.push(element)) {
             self.meta.empty_data_block += 1;
-            curr_block = &mut self.index[self.meta.empty_data_block];
+            self.grow();
         }
-
-        curr_block.push(element);
 
         let len = self.meta.len;
         self.meta.len += 1;
@@ -392,6 +382,8 @@ impl<T> SegVec<T> {
         self.index
             .push(Block::new(self.meta.block_cap, self.capacity));
         self.capacity += self.meta.block_cap;
+
+        self.first_empty_block = Some((&mut self.index[self.meta.empty_data_block]).into());
     }
 
     // TODO(eliza): consider making this an API?
@@ -632,18 +624,30 @@ impl<T> Block<T> {
     }
 
     // #[inline]
-    fn push(&mut self, element: T) {
-        debug_assert!(!self.is_full());
+    fn push(&mut self, element: T) -> bool {
+        debug_assert!(
+            !self.is_full(),
+            "assertion failed: !self.is_full(); len={}; cap={};",
+            self.len,
+            self.cap
+        );
         unsafe {
             let end = self.ptr.as_ptr().add(self.len);
             ptr::write(end, element);
             self.len += 1;
         }
+        dbg!((self.len, self.cap));
+        self.is_full()
     }
 
     #[inline]
     fn pop(&mut self) -> Option<T> {
-        debug_assert!(self.len <= self.cap);
+        debug_assert!(
+            self.len <= self.cap,
+            "assertion failed: self.len < self.cap; len={}; cap={};",
+            self.len,
+            self.cap
+        );
         if self.len == 0 {
             None
         } else {
@@ -656,8 +660,14 @@ impl<T> Block<T> {
 
     #[inline]
     fn get(&self, idx: usize) -> Option<&T> {
-        debug_assert!(self.len < self.cap);
-        if idx >= self.len {
+        debug_assert!(
+            self.len <= self.cap + 1,
+            "assertion failed: self.len <= self.cap; len={}; cap={};",
+            self.len,
+            self.cap
+        );
+        test_dbg!(let idx = idx - self.prev_cap;);
+        if idx > test_dbg!(self.len) || self.len == 0 {
             return None;
         }
 
@@ -666,7 +676,12 @@ impl<T> Block<T> {
 
     #[inline]
     fn get_mut(&mut self, idx: usize) -> Option<&mut T> {
-        debug_assert!(self.len < self.cap);
+        debug_assert!(
+            self.len <= self.cap,
+            "assertion failed: self.len <= self.cap; len={}; cap={};",
+            self.len,
+            self.cap
+        );
         if idx >= self.len {
             return None;
         }
@@ -676,13 +691,13 @@ impl<T> Block<T> {
 
     #[inline]
     fn as_slice(&self) -> &[T] {
-        debug_assert!(self.len < self.cap);
+        debug_assert!(self.len <= self.cap);
         unsafe { &*ptr::slice_from_raw_parts(self.ptr.as_ptr() as *const _, self.len) }
     }
 
     #[inline]
     fn as_mut_slice(&mut self) -> &mut [T] {
-        debug_assert!(self.len < self.cap);
+        debug_assert!(self.len <= self.cap);
         unsafe { &mut *ptr::slice_from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 }
@@ -702,16 +717,18 @@ impl<T> Drop for Block<T> {
         }
     }
 }
-// impl<T: fmt::Debug> fmt::Debug for Block<T> {
-//     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-//         f.debug_struct("Block")
-//             .field("len", &self.len())
-//             .field("capacity", &self.elements.capacity())
-//             .field("prev_cap", &self.prev_cap)
-//             .field("elements", &self.elements)
-//             .finish()
-//     }
-// }
+
+impl<T: fmt::Debug> fmt::Debug for Block<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Block")
+            .field("ptr", &self.ptr)
+            .field("len", &self.len)
+            .field("cap", &self.cap)
+            .field("prev_cap", &self.prev_cap)
+            .field("elements", &self.as_slice())
+            .finish()
+    }
+}
 
 // === impl DebugDetails ===
 
@@ -722,10 +739,10 @@ impl<T: fmt::Debug> fmt::Debug for DebugDetails<'_, T> {
         f.field("meta", &self.0.meta)
             .field("capacity", &self.0.capacity)
             .field("index", &self.0.index);
-        #[cfg(debug_assertions)]
-        {
-            f.field("is_initialized", &self.0.is_initialized);
-        }
+        // #[cfg(debug_assertions)]
+        // {
+        //     f.field("is_initialized", &self.0.is_initialized);
+        // }
         f.finish()
     }
 }
