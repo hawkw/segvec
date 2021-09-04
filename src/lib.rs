@@ -336,7 +336,7 @@ impl<T> SegVec<T> {
             };
         };
 
-        if dbg!(block.push(element)) {
+        if test_dbg!(block.push(element)) {
             self.meta.empty_data_block += 1;
             self.grow();
         }
@@ -636,7 +636,6 @@ impl<T> Block<T> {
             ptr::write(end, element);
             self.len += 1;
         }
-        dbg!((self.len, self.cap));
         self.is_full()
     }
 
